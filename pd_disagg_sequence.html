@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>PD Disaggregation Sequence Diagram</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  body { font-family: sans-serif; margin: 20px; background: #fafafa; }
+  h1 { text-align: center; }
+  .mermaid { display: flex; justify-content: center; }
+  .legend { max-width: 900px; margin: 20px auto; padding: 16px; background: #fff; border: 1px solid #ddd; border-radius: 8px; }
+  .legend h2 { margin-top: 0; }
+  .legend table { border-collapse: collapse; width: 100%; }
+  .legend th, .legend td { border: 1px solid #ddd; padding: 6px 10px; font-size: 14px; }
+  .legend th { background: #f5f5f5; }
+</style>
+</head>
+<body>
+
+<h1>vLLM / vLLM-Ascend PD 分离架构 - 调用时序图</h1>
+
+<div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant R as Router(VllmPDRouter)
+    participant SD as ServiceDiscovery(ZMQ)
+    participant P as PrefillServer(kv_producer)
+    participant KC as KVConnector
+    participant D as DecodeServer(kv_consumer)
+
+    rect rgb(230,245,255)
+    Note over R,D: 初始化阶段
+    R->>SD: 启动 ZMQ service discovery listener
+    P->>SD: 注册 prefill 实例(HTTP+ZMQ地址)
+    D->>SD: 注册 decode 实例(HTTP+ZMQ地址)
+    opt Mooncake Connector
+        R->>P: GET /query(bootstrap server)
+        P-->>R: dp_rank - engine_id mapping
+        Note over R: 缓存 MooncakePrefillInfo
+    end
+    end
+
+    rect rgb(255,250,230)
+    Note over C,D: 请求处理 - Stage 1: Prefill
+    C->>R: POST /v1/chat/completions
+
+    Note over R: 1. 选择 Prefill/Decode 实例
+    R->>SD: get_prefill_instances()
+    SD-->>R: prefill实例列表
+    R->>SD: get_decode_instances()
+    SD-->>R: decode实例列表
+    Note over R: 通过policy选择实例(prefill_policy + decode_policy)
+
+    Note over R: 2. 生成request_id = prefill_addr + decode_addr + uuid
+
+    Note over R: 3. 构建Prefill请求
+    Note over R: prepare_prefill_request(): max_tokens=1, stream=false
+
+    opt Mooncake
+        Note over R: kv_transfer_params = {do_remote_decode:true, transfer_id:"xfer-uuid"}
+    end
+    opt NIXL
+        Note over R: kv_transfer_params = {do_remote_decode:true, remote_engine_id:null, remote_host:null}
+    end
+
+    R->>P: POST /v1/chat/completions (max_tokens=1, kv_transfer_params, X-Request-Id)
+
+    Note over P: EngineCore处理
+    P->>P: Scheduler.get_num_new_matched_tokens()
+    P->>P: CacheManager分配KV blocks
+    P->>P: build_connector_meta()
+
+    Note over P: Worker执行模型前向传播
+    P->>P: start_load_kv()(异步加载远程KV)
+    P->>KC: save_kv_layer(逐层保存KV到传输引擎)
+    P->>KC: wait_for_save()
+
+    Note over P: Prefill完成,生成1个token
+    P->>P: request_finished() - 返回kv_transfer_params
+    P-->>R: Response(json): {kv_transfer_params: {remote_engine_id, remote_block_ids, remote_host, remote_port}}
+
+    Note over R: 提取kv_transfer_params,释放prefill负载
+    end
+
+    rect rgb(230,255,230)
+    Note over KC: KV Cache已通过RDMA/NCCL从Prefill传到Decode
+
+    Note over C,D: 请求处理 - Stage 2: Decode
+
+    Note over R: 4. 构建Decode请求
+    opt Mooncake
+        Note over R: kv_transfer_params = {do_remote_prefill:true, transfer_id, remote_bootstrap_addr, remote_engine_id}
+    end
+    opt NIXL
+        Note over R: 直接使用prefill响应中的kv_transfer_params
+    end
+
+    R->>D: POST /v1/chat/completions (原始max_tokens, kv_transfer_params, stream=原始值)
+
+    Note over D: EngineCore处理
+    D->>D: Scheduler.get_num_new_matched_tokens()(发现远程KV可加载)
+    D->>D: CacheManager分配KV blocks
+    D->>KC: start_load_kv()(从远程加载KV Cache)
+
+    loop 逐层加载+Attention
+        D->>KC: wait_for_layer_load(layer_i)
+        D->>D: 执行Attention(使用已加载KV)
+    end
+
+    Note over D: KV加载完成,跳过prefill,开始decode
+
+    loop 逐token生成
+        D-->>R: Stream chunk: {choices:[{delta:{content:"..."}}]}
+        R-->>C: SSE: data: {...}
+    end
+
+    D-->>R: data: [DONE]
+    R-->>C: data: [DONE]
+    end
+
+    rect rgb(245,240,255)
+    Note over C,R: 后处理
+    opt 请求了logprobs且非流式
+        R->>R: merge_logprobs(prefill_response, decode_response)
+    end
+    R->>R: 释放decode负载,记录PD metrics
+    end
+</div>
+
+<div class="legend">
+<h2>核心流程说明</h2>
+
+<h3>1. 初始化</h3>
+<p>Router 启动 ZMQ Service Discovery，动态发现 prefill/decode 实例。Mooncake 模式下额外查询每个 prefill 节点的 bootstrap server 获取 engine_id。</p>
+
+<h3>2. Stage 1: Prefill（Router → Prefill）</h3>
+<p>Router 通过负载均衡策略选择 prefill 实例，将请求改写为 max_tokens=1, stream=false，注入 kv_transfer_params.do_remote_decode=true。Prefill 执行完整 prefill 计算，KV Connector 将 KV Cache 推送到 Decode 实例，返回 kv_transfer_params。</p>
+
+<h3>3. KV Cache 传输（Prefill → Decode）</h3>
+<ul>
+<li><b>Mooncake (push)</b>: Prefill 通过 TransferEngine 主动推送 KV 到 Decode</li>
+<li><b>NIXL (pull)</b>: Decode 收到 remote_host/port/block_ids 后主动拉取</li>
+<li><b>NCCL</b>: 通过 NCCL P2P 直连传输</li>
+</ul>
+
+<h3>4. Stage 2: Decode（Router → Decode）</h3>
+<p>Router 将 prefill 返回的 kv_transfer_params 附加到原始请求，发送给 decode 实例。Decode 加载远程 KV Cache 后跳过 prefill，直接逐 token 生成，流式返回给客户端。</p>
+
+<h3>5. 关键代码路径</h3>
+<table>
+<tr><th>阶段</th><th>组件</th><th>关键文件</th></tr>
+<tr><td>路由分发</td><td>VllmPDRouter</td><td>router/src/routers/http/vllm_pd_router.rs</td></tr>
+<tr><td>负载均衡</td><td>PolicyRegistry</td><td>router/src/policies/</td></tr>
+<tr><td>服务发现</td><td>ServiceRegistry</td><td>router/src/routers/http/vllm_service_discovery.rs</td></tr>
+<tr><td>KV传输配置</td><td>KVTransferConfig</td><td>vllm/vllm/config/kv_transfer.py</td></tr>
+<tr><td>Scheduler侧连接器</td><td>KVConnectorBase_V1</td><td>vllm/vllm/distributed/kv_transfer/kv_connector/v1/base.py</td></tr>
+<tr><td>Worker侧连接器</td><td>KVConnectorModelRunnerMixin</td><td>vllm/vllm/v1/worker/kv_connector_model_runner_mixin.py</td></tr>
+<tr><td>Mooncake连接器</td><td>MooncakeConnector</td><td>vllm/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/</td></tr>
+<tr><td>NIXL连接器</td><td>NixlConnector</td><td>vllm/vllm/distributed/kv_transfer/kv_connector/v1/nixl/</td></tr>
+<tr><td>Ascend适配</td><td>AscendMultiConnector</td><td>vllm-ascend/vllm_ascend/distributed/kv_transfer/</td></tr>
+<tr><td>Proxy示例</td><td>LoadBalanceProxy</td><td>vllm-ascend/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py</td></tr>
+</table>
+</div>
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'default',
+  sequence: {
+    diagramMarginX: 20,
+    diagramMarginY: 20,
+    actorMargin: 80,
+    width: 200,
+    height: 50,
+    boxMargin: 10,
+    boxTextMargin: 5,
+    noteMargin: 10,
+    messageMargin: 40,
+    mirrorActors: true,
+    bottomMarginAdj: 1,
+    useMaxWidth: false,
+    wrap: false,
+  }
+});
+</script>
+</body>
+</html>
