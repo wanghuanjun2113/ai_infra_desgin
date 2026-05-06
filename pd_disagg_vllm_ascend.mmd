@@ -2,87 +2,59 @@ sequenceDiagram
     autonumber
     participant C as Client
     participant R as VllmPDRouter
-    participant P as Prefill(Producer)
-    participant P_ZMQ as P: SendingThread<br/>(ZMQ ROUTER)
-    participant RDMA as P2P RDMA直传<br/>(Mooncake TransferEngine)
-    participant D as Decode(Consumer)
-    participant D_ZMQ as D: RecvingThread
+    participant P as Prefill实例
+    participant D as Decode实例
 
     rect rgb(230,245,255)
-    Note over R,D_ZMQ: ===== 初始化阶段 =====
-
-    Note over R: 固定配置模式: 注册P/D到WorkerRegistry, 无服务发现
-    R->>P: GET /health (循环等待直到200 OK)
+    Note over C,D: ===== 初始化 =====
+    R->>P: GET /health (循环等待200 OK)
     P-->>R: 200 OK
-    R->>D: GET /health (循环等待直到200 OK)
+    R->>D: GET /health (循环等待200 OK)
     D-->>R: 200 OK
     R->>P: GET /query (获取engine_id)
-    P-->>R: {dp_rank: {engine_id: "xxx"}}
-
-    Note over P: register_kv_caches(): 注册KV内存到TransferEngine
-    Note over P: 启动SendingThread(ZMQ ROUTER, 监听D的元数据请求)
-    Note over D: register_kv_caches(): 注册KV内存到TransferEngine
-    Note over D: 启动RecvingThread(负责P2P拉取)
-
-    Note over R: start_health_checker(): 后台周期检查
+    P-->>R: {dp_rank: {engine_id}}
+    Note over P: 注册KV内存到TransferEngine
+    Note over D: 注册KV内存到TransferEngine
+    Note over R: 启动后台健康检查(每30-60s)
     end
 
     rect rgb(255,250,230)
-    Note over R,D_ZMQ: ===== 后台健康检查(每30-60s) =====
-
+    Note over C,D: ===== 后台健康检查 =====
     loop 每 check_interval_secs
         R->>P: GET /health
         P-->>R: 200 OK / 超时
         R->>D: GET /health
         D-->>R: 200 OK / 超时
-        Note over R: 连续失败>=3 -> set_healthy(false)
-        Note over R: 连续成功>=2 -> set_healthy(true)
+        Note over R: 连续失败>=3 -> 标记unhealthy
+        Note over R: 连续成功>=2 -> 恢复healthy
     end
     end
 
     rect rgb(245,240,255)
-    Note over C,D_ZMQ: ===== 请求处理 =====
+    Note over C,D: ===== 请求处理 =====
 
     C->>R: POST /v1/chat/completions
 
-    Note over R: 同时选择P和D(发送任何请求前)
-    Note over R: 过滤: is_available() = is_healthy() AND 熔断器可用
+    Note over R: 同时选择P和D, 过滤不健康节点
 
-    Note over R: 构建Prefill请求: max_tokens=1, stream=false
-    Note over R: kv_transfer_params={do_remote_decode:true, transfer_id}
+    R->>P: POST /v1/chat/completions<br/>(max_tokens=1, do_remote_decode:true)
+    Note over P: 执行Prefill, 生成KV Cache
+    P-->>R: 200 {kv_transfer_params: remote_block_ids, remote_host, remote_port}
 
-    R->>P: POST /v1/chat/completions<br/>(max_tokens=1, kv_transfer_params)
+    Note over R: 附加kv_transfer_params转发给D
 
-    Note over P: 执行Prefill: embedding + 全部Transformer层
-    Note over P: 生成KV Cache, 输出1个token
-    Note over P: blocks暂不释放(等待D拉取完成后释放)
+    R->>D: POST /v1/chat/completions<br/>(原始max_tokens, do_remote_prefill:true)
 
-    P-->>R: 200 {kv_transfer_params: {<br/>remote_block_ids, remote_engine_id,<br/>remote_host, remote_port,<br/>remote_request_id}}
+    D->>P: P2P RDMA: 拉取KV Cache (NPU-to-NPU直传)
+    P-->>D: 传输完成
+    Note over P: 释放KV Cache blocks
 
-    Note over R: 构建Decode请求: 附加kv_transfer_params
-
-    R->>D: POST /v1/chat/completions<br/>(原始max_tokens, kv_transfer_params={do_remote_prefill:true, ...})
-
-    Note over D: 分配KV Cache blocks, 提交P2P拉取任务
-
-    D_ZMQ->>P_ZMQ: ZMQ GET_META_MSG(请求NPU内存布局)
-    P_ZMQ-->>D_ZMQ: MooncakeAgentMetadata<br/>(NPU基地址, te_rpc_port, block_lens)
-
-    D_ZMQ->>RDMA: batch_transfer_sync_read<br/>(P2P RDMA: D直接从P的NPU内存拉取KV Cache)
-    RDMA-->>D_ZMQ: 传输完成
-
-    D_ZMQ->>P_ZMQ: ZMQ DONE_RECVING_MSG(通知P释放blocks)
-    Note over P: 收到通知, 释放KV Cache blocks
-
-    Note over D: KV加载完成, 跳过prefill, 开始decode
+    Note over D: 跳过prefill, 开始decode
 
     loop 逐token流式输出
         D-->>R: Stream chunk
         R-->>C: SSE data
     end
-
     D-->>R: [DONE]
     R-->>C: [DONE]
-
-    Note over R: 释放decode负载, 记录熔断器状态
     end
