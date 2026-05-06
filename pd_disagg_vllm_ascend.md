@@ -1,6 +1,6 @@
 # vLLM-Ascend PD 分离架构调用流程
 
-> 基于固定配置模式（`--prefill` / `--decode`）+ vllm-ascend MooncakeConnector
+> 基于固定配置模式（`--prefill` / `--decode`）+ vllm-ascend P2P KV Cache 传输（MooncakeConnector）
 >
 > 时序图: [pd_disagg_vllm_ascend.png](pd_disagg_vllm_ascend.png) | [Mermaid 源文件](pd_disagg_vllm_ascend.mmd)
 
@@ -13,7 +13,7 @@
 - **Prefill 实例**（kv_producer）：执行 prefill 计算，生成 KV Cache
 - **Decode 实例**（kv_consumer）：加载远程 KV Cache，执行 token 生成
 
-Prefill 和 Decode 之间通过 **Mooncake TransferEngine（RDMA）** 传输 KV Cache，通过 **ZMQ** 交换控制信令（元数据请求和完成通知）。没有集中式的服务发现或 bootstrap server。
+Prefill 和 Decode 之间通过 **P2P RDMA 直传**（Mooncake TransferEngine，`ascend` 后端）传输 KV Cache，数据直接在 NPU 内存之间搬运，无需经过 CPU 中转。控制信令通过 **ZMQ** 点对点交换（元数据请求和完成通知）。没有集中式的服务发现或协调服务。
 
 ## 一、初始化阶段
 
@@ -25,14 +25,14 @@ Prefill 和 Decode 之间通过 **Mooncake TransferEngine（RDMA）** 传输 KV 
 
 Router 对每个 Prefill 和 Decode 实例循环发送 `GET /health`，直到至少各有一个实例返回 200 OK。如果超时则启动失败。
 
-### 3. Mooncake Bootstrap 查询
+### 3. Bootstrap 查询
 
 Router 向每个 Prefill 实例的 bootstrap server 发送 `GET /query`，获取 `engine_id` 到 `dp_rank` 的映射关系，缓存为 `MooncakePrefillInfo`，后续构建 decode 请求时会用到。
 
-### 4. Worker 侧初始化
+### 4. Worker 侧 P2P 初始化
 
-- **Prefill Worker** 调用 `register_kv_caches()` 将 KV Cache 内存注册到 Mooncake TransferEngine，然后启动 **SendingThread**（ZMQ ROUTER socket 监听，等待 Decode 侧来拉取元数据）
-- **Decode Worker** 同样注册 KV Cache 内存到 TransferEngine，启动 **RecvingThread**（负责从 Prefill 拉取 KV Cache）
+- **Prefill Worker** 调用 `register_kv_caches()` 将 KV Cache 内存注册到 Mooncake TransferEngine，然后启动 **SendingThread**（ZMQ ROUTER socket 监听，响应 Decode 侧的元数据请求和完成通知）
+- **Decode Worker** 同样注册 KV Cache 内存到 TransferEngine，启动 **RecvingThread**（负责向 Prefill 发起 P2P 拉取）
 
 ### 5. 启动后台健康检查
 
@@ -76,21 +76,21 @@ Prefill 的 Scheduler 调用 `request_finished()` 检测到 `do_remote_decode=tr
 
 同时 Prefill 的 KV Cache blocks **暂不释放**，等待 Decode 拉取完成后才释放。
 
-### KV Cache 传输（PULL 模型）
+### P2P KV Cache 传输
 
 #### 6. Router 转发请求到 Decode
 
 Router 将 Prefill 返回的 `kv_transfer_params`（含 `do_remote_prefill: true`）附加到原始请求，发送给之前选好的 Decode 实例。
 
-#### 7. Decode 请求 Prefill 元数据
+#### 7. Decode 请求 Prefill 元数据（ZMQ 点对点）
 
-Decode 的 RecvingThread 通过 ZMQ 向 Prefill 的 SendingThread 发送 `GET_META_MSG`，请求 Prefill 的 KV Cache 内存布局信息（基地址、block 长度、TransferEngine RPC 端口等）。Prefill 回复 `MooncakeAgentMetadata`。
+Decode 的 RecvingThread 通过 ZMQ REQ 直接连接 Prefill 的 ZMQ ROUTER socket，发送 `GET_META_MSG`，请求 Prefill 的 KV Cache NPU 内存布局信息（基地址、block 长度、TransferEngine RPC 端口等）。Prefill 回复 `MooncakeAgentMetadata`。
 
-#### 8. Decode 通过 RDMA 拉取 KV Cache
+#### 8. P2P RDMA 直传（Decode 从 Prefill NPU 内存拉取）
 
-Decode 的 RecvingThread 合并连续的 block，然后调用 Mooncake TransferEngine 的 `batch_transfer_sync_read()`，通过 **RDMA READ** 直接从 Prefill 的 GPU/NPU 内存拉取 KV Cache 到 Decode 的 KV Cache 内存中。这是 **PULL 模型**——Decode 主动发起传输。
+Decode 的 RecvingThread 合并连续的 block，然后调用 Mooncake TransferEngine 的 `batch_transfer_sync_read()`，通过 **RDMA READ** 直接从 Prefill 的 NPU 内存拉取 KV Cache 到 Decode 的 NPU 内存中。全程不经过 CPU，是 **P2P 直传**。
 
-#### 9. 通知 Prefill 释放
+#### 9. 通知 Prefill 释放（ZMQ 点对点）
 
 传输完成后，Decode 的 RecvingThread 通过 ZMQ 向 Prefill 发送 `DONE_RECVING_MSG`。Prefill 收到后更新 task tracker，Scheduler 此时才释放该请求的 KV Cache blocks。
 
@@ -129,14 +129,16 @@ Router 收到完成响应后：
 
 Router 在发送任何请求之前就同时选好了 Prefill 和 Decode 实例。这意味着 Decode 的选择无法利用 Prefill 阶段的信息（如实际 KV Cache 大小），但简化了实现并减少了延迟。
 
-### 2. PULL 模型（Decode 主动拉取）
+### 2. P2P 直传（Decode 主动拉取，RDMA NPU-to-NPU）
 
-vllm-ascend 的 MooncakeConnector 采用 PULL 模型：Decode 实例主动从 Prefill 拉取 KV Cache。与上游 vLLM 的 PUSH 模型不同，PULL 模型的优势是 Decode 可以根据自己的调度节奏控制传输时机。
+KV Cache 传输采用 P2P 直传模式：Decode 实例通过 RDMA 直接从 Prefill 的 NPU 内存拉取 KV Cache，数据不经 CPU 中转。控制信令仅使用 ZMQ 点对点通信（元数据请求 + 完成通知），没有集中式协调服务。
 
-### 3. 无集中式协调
-
-没有独立的 bootstrap server 或服务发现。Prefill 和 Decode 之间的协调完全通过 Router 传递的 `kv_transfer_params` 字典完成，ZMQ 仅用于 Worker 之间的点对点信令。
-
-### 4. 延迟释放
+### 3. 延迟释放
 
 Prefill 在 prefill 完成后不立即释放 KV Cache blocks，而是等 Decode 通过 ZMQ 发送 `DONE_RECVING_MSG` 后才释放。这确保了 KV Cache 在传输完成前不会被覆盖。
+
+### 4. 三层健康保障
+
+- **启动等待**：Router 启动时阻塞直到 Worker 健康
+- **后台周期检查**：每 30-60s 探测一次，连续失败自动摘除
+- **熔断器**：请求级别被动检测，快速失败 + 自动恢复

@@ -2,30 +2,29 @@ sequenceDiagram
     autonumber
     participant C as Client
     participant R as VllmPDRouter
-    participant P as Prefill实例
-    participant P_ZMQ as Prefill SendingThread<br/>(ZMQ ROUTER)
-    participant TE as Mooncake RDMA
-    participant D as Decode实例
-    participant D_ZMQ as Decode RecvingThread
+    participant P as Prefill(Producer)
+    participant P_ZMQ as P: SendingThread<br/>(ZMQ ROUTER)
+    participant RDMA as P2P RDMA直传<br/>(Mooncake TransferEngine)
+    participant D as Decode(Consumer)
+    participant D_ZMQ as D: RecvingThread
 
     rect rgb(230,245,255)
     Note over R,D_ZMQ: ===== 初始化阶段 =====
 
-    Note over R: 注册Prefill/Decode到WorkerRegistry(无ZMQ服务发现)
-    R->>P: GET /health (启动等待直到返回200)
+    Note over R: 固定配置模式: 注册P/D到WorkerRegistry, 无服务发现
+    R->>P: GET /health (循环等待直到200 OK)
     P-->>R: 200 OK
-    R->>D: GET /health (启动等待直到返回200)
+    R->>D: GET /health (循环等待直到200 OK)
     D-->>R: 200 OK
-
-    R->>P: GET /query (Mooncake bootstrap)
+    R->>P: GET /query (获取engine_id)
     P-->>R: {dp_rank: {engine_id: "xxx"}}
-    Note over R: 缓存MooncakePrefillInfo
 
     Note over P: register_kv_caches(): 注册KV内存到TransferEngine
-    Note over P: 启动SendingThread(ZMQ ROUTER监听)
+    Note over P: 启动SendingThread(ZMQ ROUTER, 监听D的元数据请求)
     Note over D: register_kv_caches(): 注册KV内存到TransferEngine
-    Note over D: 启动RecvingThread
-    Note over R: start_health_checker(): 后台周期检查线程
+    Note over D: 启动RecvingThread(负责P2P拉取)
+
+    Note over R: start_health_checker(): 后台周期检查
     end
 
     rect rgb(255,250,230)
@@ -36,8 +35,8 @@ sequenceDiagram
         P-->>R: 200 OK / 超时
         R->>D: GET /health
         D-->>R: 200 OK / 超时
-        Note over R: 连续失败>=3次 -> set_healthy(false)
-        Note over R: 连续成功>=2次 -> set_healthy(true)
+        Note over R: 连续失败>=3 -> set_healthy(false)
+        Note over R: 连续成功>=2 -> set_healthy(true)
     end
     end
 
@@ -46,9 +45,7 @@ sequenceDiagram
 
     C->>R: POST /v1/chat/completions
 
-    Note over R: 同时选择Prefill和Decode实例(请求发送前)
-    Note over R: prefill_policy.select_worker() -> P
-    Note over R: decode_policy.select_worker() -> D
+    Note over R: 同时选择P和D(发送任何请求前)
     Note over R: 过滤: is_available() = is_healthy() AND 熔断器可用
 
     Note over R: 构建Prefill请求: max_tokens=1, stream=false
@@ -56,29 +53,28 @@ sequenceDiagram
 
     R->>P: POST /v1/chat/completions<br/>(max_tokens=1, kv_transfer_params)
 
-    Note over P: Prefill计算: token embedding + 全部Transformer层
+    Note over P: 执行Prefill: embedding + 全部Transformer层
     Note over P: 生成KV Cache, 输出1个token
+    Note over P: blocks暂不释放(等待D拉取完成后释放)
 
-    P-->>R: 200 {kv_transfer_params: {<br/>remote_block_ids, remote_engine_id,<br/>remote_host, remote_port,<br/>remote_request_id, last_token_id}}
+    P-->>R: 200 {kv_transfer_params: {<br/>remote_block_ids, remote_engine_id,<br/>remote_host, remote_port,<br/>remote_request_id}}
 
-    Note over R: 释放prefill负载
-    Note over R: 构建Decode请求: 附加prefill返回的kv_transfer_params
+    Note over R: 构建Decode请求: 附加kv_transfer_params
 
-    R->>D: POST /v1/chat/completions<br/>(原始max_tokens, kv_transfer_params={do_remote_prefill:true, remote_host/port/block_ids})
+    R->>D: POST /v1/chat/completions<br/>(原始max_tokens, kv_transfer_params={do_remote_prefill:true, ...})
 
-    Note over D: 分配KV Cache blocks
-    Note over D: start_load_kv() -> 向RecvingThread提交拉取任务
+    Note over D: 分配KV Cache blocks, 提交P2P拉取任务
 
-    D_ZMQ->>P_ZMQ: ZMQ GET_META_MSG
-    P_ZMQ-->>D_ZMQ: ZMQ MooncakeAgentMetadata<br/>(base_addr, te_rpc_port, block_lens)
+    D_ZMQ->>P_ZMQ: ZMQ GET_META_MSG(请求NPU内存布局)
+    P_ZMQ-->>D_ZMQ: MooncakeAgentMetadata<br/>(NPU基地址, te_rpc_port, block_lens)
 
-    D_ZMQ->>TE: batch_transfer_sync_read<br/>(RDMA PULL: D从P拉取KV Cache)
-    TE-->>D_ZMQ: 传输完成
+    D_ZMQ->>RDMA: batch_transfer_sync_read<br/>(P2P RDMA: D直接从P的NPU内存拉取KV Cache)
+    RDMA-->>D_ZMQ: 传输完成
 
-    D_ZMQ->>P_ZMQ: ZMQ DONE_RECVING_MSG
-    Note over P: 收到通知,释放KV Cache blocks
+    D_ZMQ->>P_ZMQ: ZMQ DONE_RECVING_MSG(通知P释放blocks)
+    Note over P: 收到通知, 释放KV Cache blocks
 
-    Note over D: KV加载完成,跳过prefill,开始逐token decode
+    Note over D: KV加载完成, 跳过prefill, 开始decode
 
     loop 逐token流式输出
         D-->>R: Stream chunk
@@ -88,5 +84,5 @@ sequenceDiagram
     D-->>R: [DONE]
     R-->>C: [DONE]
 
-    Note over R: 释放decode负载, 记录请求结果到熔断器
+    Note over R: 释放decode负载, 记录熔断器状态
     end
